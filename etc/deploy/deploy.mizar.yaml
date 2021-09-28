@@ -444,7 +444,7 @@ spec:
       hostPID: true
       initContainers:
       - name: node-init
-        image: c2cengg20190034/mizar:0.1
+        image: c2cengg20190034/mizar:0.4
         command: [./node-init.sh]
         securityContext:
           privileged: true
@@ -487,6 +487,14 @@ spec:
       serviceAccountName: mizar-operator
       terminationGracePeriodSeconds: 0
       hostNetwork: true
+      initContainers:
+      - name: daemon-init
+        image: c2cengg20190034/endpointopr:0.8
+        command: ["python3"]
+        args: ["/var/mizar/etc/docker/daemon-check.py"]
+        volumeMounts:
+        - name: mizar
+          mountPath: /home
       containers:
       - name: mizar-operator
         image: mizarnet/endpointopr:0.8
@@ -495,3 +503,8 @@ spec:
           value: 'false'
         securityContext:
           privileged: true
+      volumes:
+      - name: mizar
+        hostPath:
+          path: /var
+          type: Directory

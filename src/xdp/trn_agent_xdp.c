@@ -42,6 +42,7 @@
 
 #include "trn_datamodel.h"
 #include "trn_agent_xdp_maps.h"
+#include "trn_xdp_stats_maps.h"
 #include "trn_kern.h"
 #include "conntrack_common.h"
 
@@ -62,6 +63,10 @@ static __inline int trn_select_transit_switch(struct transit_packet *pkt,
 	*s_port = SPORT_MIN + (inhash % SPORT_BASE);
 
 	if (*s_port < SPORT_MIN || *s_port > SPORT_MAX) {
+		bpf_debug("[Agent:%ld.0x%x] trn_select_transit_switch (BUG): s_port[%d] "
+			  " is outside of port range!\n",
+			  pkt->agent_ep_tunid, bpf_ntohl(pkt->agent_ep_ipv4),
+			  *s_port);
 		return 1;
 	}
 
@@ -120,6 +125,16 @@ static __inline int trn_encapsulate(struct transit_packet *pkt,
 		d_addr = dst_r_ep->ip;
 		d_mac = dst_r_ep->mac;
 
+		__u32 inhash = jhash_2words(in_src_ip, in_dst_ip, INIT_JHASH_SEED);
+		s_port = SPORT_MIN + (inhash % SPORT_BASE);
+		if (s_port < SPORT_MIN || s_port > SPORT_MAX) {
+			bpf_debug("[Agent:%ld.0x%x] DROP (BUG): s_port[%d] "
+			 		" is outside of port range!\n",
+					pkt->agent_ep_tunid, bpf_ntohl(pkt->agent_ep_ipv4),
+			  		s_port);
+			return XDP_DROP;
+		}
+
 		bpf_debug(
 			"[Agent:%ld.0x%x] Host of 0x%x, found sending directly!\n",
 			pkt->agent_ep_tunid, bpf_ntohl(pkt->agent_ep_ipv4),
@@ -160,11 +175,15 @@ static __inline int trn_encapsulate(struct transit_packet *pkt,
 	int pod_label_value = 0;
 	int namespace_label_value = 0;
 	__u64 egress_bw_bytes_per_sec = 0;
+	__u32 pod_network_class_priority = BESTEFFORT | PRIORITY_MEDIUM;
 	packet_metadata = bpf_map_lookup_elem(&packet_metadata_map, &packet_metadata_key);
 	if (packet_metadata) {
 		pod_label_value = packet_metadata->pod_label_value;
 		namespace_label_value = packet_metadata->namespace_label_value;
 		egress_bw_bytes_per_sec = packet_metadata->egress_bandwidth_bytes_per_sec;
+		if (packet_metadata->pod_network_class_priority != 0) {
+			pod_network_class_priority = packet_metadata->pod_network_class_priority;
+		}
 	}
 
 	/* Readjust the packet size to fit the outer headers */
@@ -229,25 +248,47 @@ static __inline int trn_encapsulate(struct transit_packet *pkt,
 	pkt->ip->frag_off = 0;
 	pkt->ip->protocol = IPPROTO_UDP;
 	pkt->ip->check = 0;
-	pkt->ip->tos = 0;
 	pkt->ip->tot_len = bpf_htons(outer_ip_payload);
 	pkt->ip->daddr = d_addr;
 	pkt->ip->saddr = metadata->eth.ip;
 	pkt->ip->ttl = pkt->inner_ttl;
 
-	// Non-zero egress bandwidth configuration => low priority Pod
-	if (egress_bw_bytes_per_sec > 0) {
-		pkt->ip->tos |= IPTOS_MINCOST;
+	__u8 dscp_code = 0;
+	switch (pod_network_class_priority) {
+	case (PREMIUM|PRIORITY_HIGH):
+		dscp_code = DSCP_PREMIUM_HIGH;
+		break;
+	case (PREMIUM|PRIORITY_MEDIUM):
+		dscp_code = DSCP_PREMIUM_MEDIUM;
+		break;
+	case (PREMIUM|PRIORITY_LOW):
+		dscp_code = DSCP_PREMIUM_LOW;
+		break;
+	case (EXPEDITED|PRIORITY_HIGH):
+		dscp_code = DSCP_EXPEDITED_HIGH;
+		break;
+	case (EXPEDITED|PRIORITY_MEDIUM):
+		dscp_code = DSCP_EXPEDITED_MEDIUM;
+		break;
+	case (EXPEDITED|PRIORITY_LOW):
+		dscp_code = DSCP_EXPEDITED_LOW;
+		break;
+	case (BESTEFFORT|PRIORITY_HIGH):
+		dscp_code = DSCP_BESTEFFORT_HIGH;
+		break;
+	case (BESTEFFORT|PRIORITY_LOW):
+		dscp_code = DSCP_BESTEFFORT_LOW;
+		break;
+	default:
+		dscp_code = 0;
 	}
-	// Support low priority traffic classification from Pod
-	if (pkt->inner_tos & IPTOS_MINCOST) {
-		pkt->ip->tos |= IPTOS_MINCOST;
-	}
+	pkt->ip->tos = dscp_code << 2;
 
 	c_sum = 0;
 	trn_ipv4_csum_inline(pkt->ip, &c_sum);
 	pkt->ip->check = c_sum;
 
+	pkt->udp->check = 0;
 	pkt->udp->source = bpf_htons(s_port); // TODO: a hash value based on inner IP packet
 	pkt->udp->dest = GEN_DSTPORT;
 	pkt->udp->len = bpf_htons(outer_udp_payload);
@@ -283,7 +324,7 @@ static __inline int trn_encapsulate(struct transit_packet *pkt,
 
 	pkt->namespace_label_value_opt->opt_class = TRN_GNV_OPT_CLASS;
 	pkt->namespace_label_value_opt->type = TRN_GNV_NAMESPACE_LABEL_VALUE_OPT_TYPE;
-	pkt->namespace_label_value_opt->length = sizeof(pkt->namespace_label_value_opt->label_value_data) / 4;;
+	pkt->namespace_label_value_opt->length = sizeof(pkt->namespace_label_value_opt->label_value_data) / 4;
 	pkt->namespace_label_value_opt->label_value_data.value = namespace_label_value;
 
 	/* If the source and dest address of the tunneled packet is the
@@ -300,8 +341,8 @@ static __inline int trn_encapsulate(struct transit_packet *pkt,
 		bpf_tail_call(pkt->xdp, &jmp_table, key);
 	}
 
-	if (pkt->ip->tos & IPTOS_MINCOST) {
-		bpf_debug("[Agent:%ld.0x%x] Low priority pkt to daddr=%x - XDP_PASS\n",
+	if ((dscp_code != DSCP_PREMIUM_HIGH) && (dscp_code != DSCP_PREMIUM_MEDIUM) && (dscp_code != DSCP_PREMIUM_LOW)) {
+		bpf_debug("[Agent:%ld.0x%x] Non premium pkt to daddr=%x - XDP_PASS\n",
 			pkt->agent_ep_tunid, bpf_ntohl(pkt->agent_ep_ipv4), pkt->ip->daddr);
 		return XDP_PASS;
 	}
@@ -410,27 +451,27 @@ static __inline int trn_process_inner_ip(struct transit_packet *pkt)
 			__u8 conn_allowed = (pkt->inner_ipv4_tuple.protocol == IPPROTO_UDP) ? FLAG_REEVAL : 0;
 			conntrack_set_conn_state(&conn_track_cache, pkt->agent_ep_tunid, &pkt->inner_ipv4_tuple, conn_allowed);
 		}
-	}
 
-	/* Check if we need to apply a forward flow update */
+		/* Check if we need to apply a forward flow update */
 
-	struct ipv4_tuple_t in_tuple;
-	struct scaled_endpoint_remote_t *out_tuple;
-	__builtin_memcpy(&in_tuple, &pkt->inner_ipv4_tuple,
-			 sizeof(struct ipv4_tuple_t));
+		struct ipv4_tuple_t in_tuple;
+		struct scaled_endpoint_remote_t *out_tuple;
+		__builtin_memcpy(&in_tuple, &pkt->inner_ipv4_tuple,
+			 	sizeof(struct ipv4_tuple_t));
 
-	out_tuple = bpf_map_lookup_elem(fwd_flow_mod_cache, &in_tuple);
+		out_tuple = bpf_map_lookup_elem(fwd_flow_mod_cache, &in_tuple);
 
-	if (out_tuple) {
-		/* Modify the inner packet accordingly */
-		trn_set_src_dst_port(pkt, out_tuple->sport, out_tuple->dport);
-		trn_set_src_dst_inner_ip_csum(pkt, out_tuple->saddr,
-					      out_tuple->daddr);
-		trn_set_dst_mac(pkt->inner_eth, out_tuple->h_dest);
-	} else {
-		bpf_debug("[Agent:%ld.0x%x] No dest IP address found! [%d]\n",
-			  pkt->agent_ep_tunid, bpf_ntohl(in_tuple.daddr),
-			  __LINE__);
+		if (out_tuple) {
+			/* Modify the inner packet accordingly */
+			trn_set_src_dst_port(pkt, out_tuple->sport, out_tuple->dport);
+			trn_set_src_dst_inner_ip_csum(pkt, out_tuple->saddr,
+					      	out_tuple->daddr);
+			trn_set_dst_mac(pkt->inner_eth, out_tuple->h_dest);
+		} else {
+			bpf_debug("[Agent:%ld.0x%x] No dest IP address found! [%d]\n",
+			  	pkt->agent_ep_tunid, bpf_ntohl(in_tuple.daddr),
+			  	__LINE__);
+		}
 	}
 
 	return trn_redirect(pkt, pkt->inner_ip->saddr, pkt->inner_ip->daddr);
@@ -574,20 +615,34 @@ int _agent(struct xdp_md *ctx)
 
 	int action = trn_process_inner_eth(&pkt);
 
-	if (action == XDP_PASS)
-		return xdpcap_exit(ctx, &xdpcap_hook, XDP_PASS);
+	bpf_debug("[Agent:%ld.0x%x] action=%d\n", pkt.agent_ep_tunid,
+		  bpf_ntohl(pkt.agent_ep_ipv4), action);
 
-	if (action == XDP_DROP)
-		return xdpcap_exit(ctx, &xdpcap_hook, XDP_DROP);
-
-	if (action == XDP_TX)
-		return xdpcap_exit(ctx, &xdpcap_hook, XDP_TX);
-
-	if (action == XDP_ABORTED)
-		return xdpcap_exit(ctx, &xdpcap_hook, XDP_ABORTED);
-
-	if (action == XDP_REDIRECT)
+	__u32 tail_call_key = XDP_TXSTATS_PASS;
+	switch (action) {
+	case XDP_REDIRECT:
+		tail_call_key = XDP_TXSTATS_REDIRECT;
+		bpf_tail_call(pkt.xdp, &jmp_table, tail_call_key);
 		return xdpcap_exit(ctx, &xdpcap_hook, XDP_REDIRECT);
+	case XDP_PASS:
+		tail_call_key = XDP_TXSTATS_PASS;
+		bpf_tail_call(pkt.xdp, &jmp_table, tail_call_key);
+		return xdpcap_exit(ctx, &xdpcap_hook, XDP_PASS);
+	case XDP_DROP:
+		tail_call_key = XDP_TXSTATS_DROP;
+		bpf_tail_call(pkt.xdp, &jmp_table, tail_call_key);
+		return xdpcap_exit(ctx, &xdpcap_hook, XDP_DROP);
+	case XDP_TX:
+		return xdpcap_exit(ctx, &xdpcap_hook, XDP_TX);
+	case XDP_ABORTED:
+		tail_call_key = XDP_TXSTATS_ABORTED;
+		bpf_tail_call(pkt.xdp, &jmp_table, tail_call_key);
+		return xdpcap_exit(ctx, &xdpcap_hook, XDP_ABORTED);
+	default:
+		tail_call_key = XDP_TXSTATS_PASS;
+		bpf_tail_call(pkt.xdp, &jmp_table, tail_call_key);
+		return xdpcap_exit(ctx, &xdpcap_hook, XDP_PASS);
+	}
 
 	return xdpcap_exit(ctx, &xdpcap_hook, XDP_PASS);
 }
